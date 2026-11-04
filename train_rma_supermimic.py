@@ -27,6 +27,9 @@ import sys
 import time
 from typing import Dict, Any, List, Optional, Tuple
 
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.50"
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -34,9 +37,6 @@ import optax
 import h5py
 from rich.console import Console
 from rich.table import Table
-
-os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.75")
-os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -83,7 +83,7 @@ def parse_args():
                         help="Number of parallel simulator environments.")
     parser.add_argument("--batch-size-wm", type=int, default=64,
                         help="Batch size for World Model window updates.")
-    parser.add_argument("--batch-size-pi", type=int, default=64,
+    parser.add_argument("--batch-size-pi", type=int, default=32,
                         help="Batch size for policy imagination BPTT rollouts.")
     parser.add_argument("--k-window", type=int, default=8,
                         help="Autoregressive window length k for World Model.")
@@ -280,6 +280,14 @@ def evaluate_policy_multimaneuver(policy: SuperMimicPolicy,
                 jnp.asarray(s_curr), u_rpm, jnp.asarray(xi_val), substeps=4, sub_dt=0.005
             ))
             s_curr = s_next
+
+            if np.isnan(s_curr).any() or np.isinf(s_curr).any() or np.linalg.norm(s_curr[0:3] - traj[t + 1, 0:3]) > 5.0:
+                remaining = traj_len - t
+                pos_errs.extend([5.0] * remaining)
+                wy_all.extend([0.0] * remaining)
+                r33_all.extend([0.0] * remaining)
+                z_all.extend([0.0] * remaining)
+                break
 
             err = np.linalg.norm(s_curr[0:3] - traj[t + 1, 0:3])
             pos_errs.append(err)

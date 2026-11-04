@@ -1,0 +1,72 @@
+[project]
+name = "supermimic-workspace"
+version = "0.1.0"
+description = "Quadrotor RL (brax/JAX, CUDA 13) workspace; optional Isaac Lab 3 group for supermimic_vibed"
+requires-python = "==3.12.*"
+
+dependencies = [
+    # --- crazyflie_nn: brax PPO on JAX with CUDA 13 plugins ---
+    "jax[cuda13]>=0.4.6",
+    "brax>=0.14.2",
+    "orbax-checkpoint>=0.11.22",
+    # --- tooling / plotting / config ---
+    "numpy>=2",
+    "matplotlib>=3.8",
+    "pillow>=10.0",
+    "pyyaml>=6.0.2",
+    "rich>=13.0",
+    "tqdm>=4.67.1",
+    # --- optimal control / MPC (C++ SQP solver; Python module is `ssqpy`) ---
+    "ssqp>=0.1.2",
+    "h5py>=3.16.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+# Isaac Lab 3 stack for supermimic_vibed (kit-less Newton / MuJoCo-Warp).
+# Heavy: ~21 GB of wheels, dominated by Isaac Sim's Kit extension caches.
+# NOT installed by default. Enable with:  uv sync --group isaac
+# Downloaded wheels stay in ~/.cache/uv, so toggling groups later is cheap.
+isaac = [
+    # "isaacsim" -> isaacsim[all,extscache]==6.2.0.0 (USD/pxr, physics caches).
+    # The "importers" extra is deliberately omitted: it pins
+    # isaacsim-asset-isolated==6.2.0.0 -> usd-exchange==2.3.0, which conflicts with
+    # isaaclab's own usd-exchange==3.0.1. See ENVIRONMENT.md.
+    "isaaclab[isaacsim]==3.0.0",
+    # isaaclab 3.0.0 pins these exact versions; +cu130 comes from the index below
+    "torch==2.11.0",
+    "torchvision==0.26.0",
+    "tqdm>=4.67.1",
+]
+
+[tool.uv]
+# Isaac Sim / Newton wheels are large; fail fast instead of half-installing.
+link-mode = "copy"
+# Isaac Sim pins opencv-python-headless-noffmpeg==4.14.0.94rc3, which only exists on
+# NVIDIA's index (pypi.org has a 0.0.0a0 placeholder), so versions must be compared
+# across both indexes.
+index-strategy = "unsafe-best-match"
+# isaacsim-kernel 6.2.0.0 pins urllib3==2.7.0 while isaaclab 3.0.0 requires
+# urllib3>=2.8.0. 2.8.0 is the current release and API-compatible.
+override-dependencies = ["urllib3>=2.8.0"]
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu130" }]
+torchvision = [{ index = "pytorch-cu130" }]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

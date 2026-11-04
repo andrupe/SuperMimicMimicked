@@ -54,8 +54,23 @@ from quadrotor.policy_critic import (
 from quadrotor.rotations_jax import rot_angle_sq_jax, so3_exp_jax
 from quadrotor.supermimic import (
     SuperMimicPolicy, compute_obs, normalize_obs, norm_action_to_rpm,
-    export_firmware_header, save_checkpoint
+    export_firmware_header
 )
+
+
+def save_rma_checkpoint(path: str, it: int, p_policy: Any, p_critic: Any, p_wm: Any,
+                        obs_mean: np.ndarray, obs_std: np.ndarray, best_val_rmse: float):
+    """Save RMA checkpoint with model weights and statistics."""
+    np.savez_compressed(
+        path,
+        iteration=it,
+        policy_params=p_policy,
+        critic_params=p_critic,
+        wm_params=p_wm,
+        obs_mean=obs_mean,
+        obs_std=obs_std,
+        best_val_rmse=best_val_rmse
+    )
 from quadrotor.supermimic_env import (
     MotionReferenceLibrary, sim_step_multi_substeps
 )
@@ -256,50 +271,36 @@ def evaluate_policy_multimaneuver(policy: SuperMimicPolicy,
     suites = ["nominal", "sensor_noise", "domain_randomization"]
     results = {}
 
-    def run_single_rollout(traj, a0, xi_val, noise_p, noise_g):
-        traj_len = len(traj) - 1
-        s_curr = traj[0]
-        a_curr = a0
-        pos_errs = []
-        wy_all = []
-        r33_all = []
-        z_all = []
+    @jax.jit
+    def run_single_rollout_scanned(p_curr, xs_ref, a0, xi_val, noise_p, noise_g):
+        H = len(xs_ref) - 1
+        def step(carry, t):
+            s_curr, a_prev = carry
+            p_tgt = xs_ref[t + 1, 0:3]
+            o = compute_obs(s_curr, p_tgt, a_prev)
+            o = o.at[0:3].add(noise_p[t]).at[15:18].add(noise_g[t])
+            o_n = normalize_obs(o, obs_mean_jax, obs_std_jax)
+            a = policy.apply({"params": p_curr}, o_n)
+            u = norm_action_to_rpm(a)
+            s_next = sim_step_multi_substeps(s_curr, u, xi_val, substeps=4, sub_dt=0.005)
+            err = jnp.linalg.norm(s_next[0:3] - xs_ref[t + 1, 0:3])
+            err_clamped = jnp.where(jnp.isnan(err) | (err > 3.0), 3.0, err)
+            step_stats = (err_clamped, s_next[16], s_next[11], s_next[2])
+            return (s_next, a), step_stats
 
-        for t in range(traj_len):
-            p_target = traj[t + 1, 0:3]
-            s_obs = s_curr.copy()
-            s_obs[0:3] += noise_p[t]
-            s_obs[15:18] += noise_g[t]
-
-            obs = compute_obs(s_obs, p_target, a_curr)
-            obs_n = normalize_obs(jnp.asarray(obs), obs_mean_jax, obs_std_jax)
-            a_curr = np.array(policy.apply({"params": p_policy}, obs_n))
-            u_rpm = norm_action_to_rpm(jnp.asarray(a_curr))
-
-            s_next = np.array(sim_step_multi_substeps(
-                jnp.asarray(s_curr), u_rpm, jnp.asarray(xi_val), substeps=4, sub_dt=0.005
-            ))
-            s_curr = s_next
-
-            if np.isnan(s_curr).any() or np.isinf(s_curr).any() or np.linalg.norm(s_curr[0:3] - traj[t + 1, 0:3]) > 5.0:
-                remaining = traj_len - t
-                pos_errs.extend([5.0] * remaining)
-                wy_all.extend([0.0] * remaining)
-                r33_all.extend([0.0] * remaining)
-                z_all.extend([0.0] * remaining)
-                break
-
-            err = np.linalg.norm(s_curr[0:3] - traj[t + 1, 0:3])
-            pos_errs.append(err)
-            wy_all.append(s_curr[16]) # Pitch rate wy
-            r33_all.append(s_curr[11]) # R33 attitude
-            z_all.append(s_curr[2])
-
-        rmse = float(np.sqrt(np.mean(np.square(pos_errs)))) * 100.0 # cm
-        max_err = float(np.max(pos_errs)) * 100.0 # cm
-        min_r33 = float(np.min(r33_all))
-        min_z = float(np.min(z_all))
+        _, (errs, wys, r33s, zs) = jax.lax.scan(step, (xs_ref[0], a0), jnp.arange(H))
+        rmse = jnp.sqrt(jnp.mean(jnp.square(errs))) * 100.0
+        max_err = jnp.max(errs) * 100.0
+        min_r33 = jnp.min(r33s)
+        min_z = jnp.min(zs)
         return rmse, max_err, min_r33, min_z
+
+    def run_single_rollout(traj, a0, xi_val, noise_p, noise_g):
+        r, m, r33, z = run_single_rollout_scanned(
+            p_policy, jnp.asarray(traj), jnp.asarray(a0), jnp.asarray(xi_val),
+            jnp.asarray(noise_p), jnp.asarray(noise_g)
+        )
+        return float(r), float(m), float(r33), float(z)
 
     for suite in suites:
         suite_metrics = {
@@ -561,9 +562,9 @@ def run_training():
     policy_net = SuperMimicPolicy()
     p_policy = policy_net.init(k_pi, jnp.zeros(22))["params"]
 
-    # Privileged Critic: observes invariant features (14) + 14-dim DR + pos_err (3) = 31 dims
+    # Privileged Critic: observes invariant features (17) + 14-dim DR + pos_err (3) = 34 dims
     critic_net = PrivilegedCritic()
-    p_critic = critic_net.init(k_c, jnp.zeros(31))["params"]
+    p_critic = critic_net.init(k_c, jnp.zeros(34))["params"]
 
     # World Model
     wm_net = WorldModel(hidden_dim=256)
@@ -720,7 +721,7 @@ def run_training():
                 )
 
         # Sample batch of reset points and trajectories
-        chosen_trajs, chosen_frames, chosen_bins = ref_lib.sample_reset_frames(args.batch_size_pi, rng_np)
+        chosen_bins, chosen_trajs, chosen_frames = ref_lib.sample_reset_frames(args.batch_size_pi, rng_np)
         s0_batch = []
         a_init_batch = []
         ref_batch = []
@@ -796,6 +797,10 @@ def run_training():
                 best_val_rmse = nom_rmse
                 # Export best firmware matrices.h
                 export_firmware_header(p_policy, obs_mean, obs_std, args.out_dir)
+                save_rma_checkpoint(
+                    os.path.join(ckpt_dir, "checkpoint_best.npz"),
+                    it, p_policy, p_critic, p_wm, obs_mean, obs_std, best_val_rmse
+                )
                 # Also directly copy to crazyflie_nn/firmware/matrices.h
                 fw_dest = "crazyflie_nn/firmware/matrices.h"
                 if os.path.exists(os.path.dirname(fw_dest)):
@@ -823,7 +828,7 @@ def run_training():
         # Periodic Checkpoint
         if it % ckpt_freq == 0 or it == total_iters:
             ckpt_path = os.path.join(ckpt_dir, f"ckpt_iter_{it:05d}.npz")
-            save_checkpoint(ckpt_path, it, p_policy, p_critic, p_wm, obs_mean, obs_std, best_val_rmse)
+            save_rma_checkpoint(ckpt_path, it, p_policy, p_critic, p_wm, obs_mean, obs_std, best_val_rmse)
 
         # Budget check
         if elapsed_s >= max_runtime_s:

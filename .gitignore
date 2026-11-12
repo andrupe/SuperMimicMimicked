@@ -1,9 +1,13 @@
 .venv/
+**/.venv/
 __pycache__/
+**/__pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+**/.pytest_cache/
 .DS_Store
 *.swp
 *.swo
 logs/rma_supermimic_production/checkpoints/
+.bin/

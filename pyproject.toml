@@ -1,7 +1,7 @@
 [project]
 name = "supermimic-workspace"
 version = "0.1.0"
-description = "Quadrotor RL (brax/JAX, CUDA 13) workspace; optional Isaac Lab 3 group for supermimic_vibed"
+description = "Quadrotor RL (brax/JAX, CUDA 13) workspace; official SuperMimic (mjlab) in supermimic/"
 requires-python = "==3.12.*"
 
 dependencies = [

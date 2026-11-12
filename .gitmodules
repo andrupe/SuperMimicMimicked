@@ -1,0 +1,6 @@
+[submodule "supermimic"]
+	path = supermimic
+	url = https://github.com/HybridRobotics/supermimic.git
+[submodule "mjlab_research"]
+	path = mjlab_research
+	url = https://github.com/HybridRobotics/mjlab_research.git

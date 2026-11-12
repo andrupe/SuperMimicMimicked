@@ -1,7 +1,9 @@
 # Workspace environment (uv, CUDA 13)
 
 Primary project: **`crazyflie_nn`** — quadrotor simulation and control with brax/JAX.
-`supermimic_vibed` (Isaac Lab 3) is available as an **opt-in dependency group**.
+Official **`supermimic`** (built on `mjlab` / MuJoCo-Warp) is integrated in `supermimic/`.
+
+> **Rollback Note**: The legacy `supermimic_vibed` (Isaac Lab 3) is preserved on `main` and tagged as `rollback-to-supermimic-vibed`. To revert, simply run `git checkout rollback-to-supermimic-vibed`.
 
 Target machine: **RTX 2050 (4 GB, sm_86)**, driver 595.91, CUDA 13 capable, 8 cores, 13 GB RAM.
 No system CUDA toolkit / `nvcc` is needed — the CUDA runtime comes from the wheels.
@@ -22,14 +24,20 @@ uv sync --no-dev         # runtime only
 `uv` lives in `~/.local/bin` — `source ~/.local/bin/env` once per shell.
 All commands below work as `uv run <cmd>` without activating the venv.
 
-## Install the Isaac Lab stack (optional, heavy)
+## Official SuperMimic Stack (`supermimic/` & `mjlab_research/`)
+
+Built on **`mjlab`** (MuJoCo-Warp native, standalone Isaac Lab API, Python 3.13) — no 21 GB Isaac Sim dependency!
 
 ```bash
-uv sync --group isaac    # ~21 GB of wheels, mostly Isaac Sim Kit extension caches
+cd supermimic
+uv sync
+uv run pytest -q                 # verified: 37/37 passing
+uv run src/supermimic/scripts/train.py SuperMimic-GenCoord-G1 --help
 ```
 
-Only needed for `supermimic_vibed`. Wheels stay in `~/.cache/uv`, so toggling back and forth
-later does not re-download. `~/.venv` grows to ~26 GB when this group is installed.
+### Hardware Support
+- **Mac (Apple Silicon)**: CPU execution is verified and working for testing, evaluation, and visualization. Mac GPU (`mps`) is **not supported** by NVIDIA Warp (`ValueError: Invalid device identifier: mps`).
+- **NVIDIA GPU (Linux)**: Full GPU acceleration for world-model training and BPTT policy learning.
 
 ## Verified stack (default group)
 

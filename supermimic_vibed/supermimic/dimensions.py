@@ -1,2 +1,0 @@
-STATE_DIM = 71
-XI_DIM = 33

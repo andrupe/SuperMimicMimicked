@@ -10,4 +10,6 @@ __pycache__/
 *.swp
 *.swo
 logs/rma_supermimic_production/checkpoints/
+logs/
+*.pt
 .bin/

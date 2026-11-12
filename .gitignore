@@ -13,3 +13,4 @@ logs/rma_supermimic_production/checkpoints/
 logs/
 *.pt
 .bin/
+MUJOCO_LOG.TXT

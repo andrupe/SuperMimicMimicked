@@ -1,0 +1,63 @@
+<mujoco model="bitcraze_crazyflie">
+  <compiler angle="radian" autolimits="true"/>
+
+  <default>
+    <geom rgba="0.2 0.2 0.2 1"/>
+    <site size="0.004" rgba="1 0 0 1"/>
+  </default>
+
+  <worldbody>
+    <light pos="0 0 3" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
+    <geom name="ground" type="plane" size="10 10 0.01" rgba="0.9 0.9 0.9 1"/>
+
+    <body name="base" pos="0 0 0.5">
+      <freejoint name="root"/>
+      <!-- Physical mass = 0.033 kg (33 grams), inertia from Bitcraze / crazyflie_nn -->
+      <inertial pos="0 0 0" mass="0.033" diaginertia="16.6e-6 16.6e-6 29.3e-6"/>
+
+      <!-- Central PCB Core -->
+      <geom name="body_core" type="box" size="0.015 0.015 0.005" rgba="0.12 0.12 0.12 1"/>
+
+      <!-- 4 Motor Arms (arm length L = 0.046m, 45 degree angle -> offset 0.0325m) -->
+      <geom name="arm_fl" type="cylinder" size="0.0015 0.023" pos="0.0163 0.0163 0" quat="0.92388 0 0 0.38268" rgba="0.25 0.25 0.25 1"/>
+      <geom name="arm_fr" type="cylinder" size="0.0015 0.023" pos="0.0163 -0.0163 0" quat="0.38268 0 0 0.92388" rgba="0.25 0.25 0.25 1"/>
+      <geom name="arm_rl" type="cylinder" size="0.0015 0.023" pos="-0.0163 0.0163 0" quat="0.38268 0 0 0.92388" rgba="0.25 0.25 0.25 1"/>
+      <geom name="arm_rr" type="cylinder" size="0.0015 0.023" pos="-0.0163 -0.0163 0" quat="0.92388 0 0 0.38268" rgba="0.25 0.25 0.25 1"/>
+
+      <!-- Motor Mounts -->
+      <geom name="motor_fl" type="cylinder" size="0.0035 0.008" pos="0.032527 0.032527 0" rgba="0.1 0.1 0.1 1"/>
+      <geom name="motor_fr" type="cylinder" size="0.0035 0.008" pos="0.032527 -0.032527 0" rgba="0.1 0.1 0.1 1"/>
+      <geom name="motor_rl" type="cylinder" size="0.0035 0.008" pos="-0.032527 0.032527 0" rgba="0.1 0.1 0.1 1"/>
+      <geom name="motor_rr" type="cylinder" size="0.0035 0.008" pos="-0.032527 -0.032527 0" rgba="0.1 0.1 0.1 1"/>
+
+      <!-- Rotor Application Sites -->
+      <site name="rotor_fl" pos="0.032527 0.032527 0.008"/>
+      <site name="rotor_fr" pos="0.032527 -0.032527 0.008"/>
+      <site name="rotor_rl" pos="-0.032527 0.032527 0.008"/>
+      <site name="rotor_rr" pos="-0.032527 -0.032527 0.008"/>
+
+      <!-- Visual Propeller Discs -->
+      <geom name="prop_fl" type="cylinder" size="0.023 0.001" pos="0.032527 0.032527 0.01" rgba="1 0.2 0.2 0.5" contype="0" conaffinity="0"/>
+      <geom name="prop_fr" type="cylinder" size="0.023 0.001" pos="0.032527 -0.032527 0.01" rgba="0.2 1 0.2 0.5" contype="0" conaffinity="0"/>
+      <geom name="prop_rl" type="cylinder" size="0.023 0.001" pos="-0.032527 0.032527 0.01" rgba="0.2 0.2 1 0.5" contype="0" conaffinity="0"/>
+      <geom name="prop_rr" type="cylinder" size="0.023 0.001" pos="-0.032527 -0.032527 0.01" rgba="1 1 0.2 0.5" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <!--
+      Site motors applying vertical thrust (gear z = 1.0) and reactive yaw torque.
+      Reactive torque ratio = KM / KF = 1.34e-10 / 2.25e-8 = 0.0059556 m.
+      FL: rotates CW -> negative yaw torque
+      FR: rotates CCW -> positive yaw torque
+      RL: rotates CCW -> negative yaw torque
+      RR: rotates CW -> positive yaw torque
+      Max thrust per motor = KF * (2618 rad/s)^2 = 0.1542 N.
+      Total max thrust = 0.617 N (TWR = 1.91).
+    -->
+    <motor name="thrust_fl" site="rotor_fl" gear="0 0 1 0 0 -0.005956" ctrlrange="0 0.1542"/>
+    <motor name="thrust_fr" site="rotor_fr" gear="0 0 1 0 0 0.005956" ctrlrange="0 0.1542"/>
+    <motor name="thrust_rl" site="rotor_rl" gear="0 0 1 0 0 -0.005956" ctrlrange="0 0.1542"/>
+    <motor name="thrust_rr" site="rotor_rr" gear="0 0 1 0 0 0.005956" ctrlrange="0 0.1542"/>
+  </actuator>
+</mujoco>

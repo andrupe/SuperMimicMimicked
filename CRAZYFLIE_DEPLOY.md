@@ -14,9 +14,9 @@ This guide walks through building, flashing, and flying the exported **`exp25_50
 
 ### On macOS (Apple Silicon or Intel)
 ```bash
-# 1. Install ARM cross-compiler + GNU make
+# 1. Install ARM cross-compiler + GNU make + GNU coreutils/sed (needed by Kbuild merge_config.sh)
 brew install --cask gcc-arm-embedded
-brew install make git
+brew install make git coreutils gnu-sed
 
 # 2. Install Python flight client (inside your preferred venv)
 python3 -m venv .venv_cf && source .venv_cf/bin/activate
@@ -36,10 +36,11 @@ pip install numpy cflib cfclient
 Clone `crazyflie-firmware` next to `SuperMimicMimicked` and copy the controller files into a new OOT app:
 
 ```bash
-# Adjust REPO_DIR if you cloned SuperMimicMimicked somewhere else
+# Run from inside the SuperMimicMimicked repo root so ../crazyflie-firmware sits next to it
 export REPO_DIR="$PWD"
 
-git clone --recursive https://github.com/bitcraze/crazyflie-firmware.git ../crazyflie-firmware
+# --shallow-submodules + GIT_LFS_SKIP_SMUDGE=1 avoids HTTP/2 timeouts and huge LFS downloads in CMSIS_5
+GIT_LFS_SKIP_SMUDGE=1 git clone --recursive --shallow-submodules https://github.com/bitcraze/crazyflie-firmware.git ../crazyflie-firmware
 cd ../crazyflie-firmware
 cp -r examples/app_hello_world examples/supermimic_rl
 cd examples/supermimic_rl
@@ -68,11 +69,19 @@ EOF
 1. Power off the Crazyflie, then **hold the power button for ~3 seconds** until both blue LEDs blink (bootloader mode).
 2. Plug in your **Crazyradio PA** and run:
    ```bash
-   # On macOS (use gmake if system make is old, or standard make)
-   make -j$(sysctl -n hw.ncpu 2>/dev/null || nproc)
-   make cload
+   # On macOS, use gmake (Homebrew GNU Make) and ensure GNU coreutils/sed are first in PATH for merge_config.sh:
+   export PATH="/opt/homebrew/opt/coreutils/libexec/gnubin:/opt/homebrew/opt/gnu-sed/libexec/gnubin:$PATH"
+   gmake -j$(sysctl -n hw.ncpu)
+   # Verify OOT controller is enabled in build/.config (Flash should be ~45% / ~462 KiB):
+   grep -E "CONFIG_APP_ENABLE|CONFIG_CONTROLLER_OOT" build/.config
+   gmake cload
+
+   # On Ubuntu / Debian Linux:
+   # make -j$(nproc) && make cload
    ```
-3. Wait for `Restarting`. The Crazyflie boots safely into stock **PID (`stabilizer.controller = 1`)**, with your NN controller loaded in slot **`5` (`stabilizer.controller = 5`)**.
+   > [!TIP]
+   > If `merge_config.sh` printed `readlink: illegal option -- m` or `cp: illegal option -- T` because GNU coreutils/sed weren't in `PATH`, `CONFIG_APP_ENABLE` and `CONFIG_CONTROLLER_OOT` won't be set in `build/.config`. Either prepend `gnubin` to `PATH` as shown above and rebuild, or set `CONFIG_APP_ENABLE=y` and `CONFIG_CONTROLLER_OOT=y` in `build/.config` and re-run `gmake`.
+3. Wait for `Restarting`. Your NN OOT controller is loaded in slot **`6` (`stabilizer.controller = 6`)** (and stock PID is **`1`**).
 
 ---
 
@@ -83,6 +92,7 @@ EOF
 3. Always check trajectory bounds with `--dry-run` before flying:
    ```bash
    cd "$REPO_DIR"
+   source .venv_cf/bin/activate
    python3 scratch/fly_trajectory.py --dry-run --family figure8 --scale 0.5
    ```
 
@@ -93,7 +103,7 @@ EOF
 Press **`Ctrl+C`** at any time during flight to immediately switch `stabilizer.controller` back to **`1` (PID)** and land.
 
 ### Test 1 — 5-Second Hover Handoff (Run this first!)
-Takes off to `0.8 m` under PID (`1`), switches to the `100 Hz` NN (`5`) for `5 s`, then switches back to PID (`1`) and lands:
+Takes off to `0.8 m` under PID (`1`), switches to the `100 Hz` NN (`6`) for `5 s`, then switches back to PID (`1`) and lands:
 ```bash
 python3 scratch/fly_trajectory.py \
   --hover-only --hover-z 0.8 --duration 5.0 \

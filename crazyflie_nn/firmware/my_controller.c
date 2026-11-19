@@ -21,7 +21,7 @@
 #define SM_POS_ERR_CLIP 1.5f
 #define SM_ARM_LEN_OVER_SQRT2 (0.046f / 1.41421356f)
 #define SM_KM_OVER_KF (1.34e-10f / 2.25e-8f)
-#define SM_HIST_STRIDE 2
+#define SM_HIST_STRIDE 1
 #define SM_RING_LEN ((SM_HIST_LEN - 1) * SM_HIST_STRIDE + 1)
 
 static float obs_ring[SM_RING_LEN][SM_FRAME_DIM];
@@ -63,7 +63,7 @@ static inline void world_to_body(const quaternion_t *q, float wx, float wy, floa
 }
 
 void appMain(void) {
-  DEBUG_PRINT("SuperMimic OOT RL controller ready (100 Hz, stride=2).\n");
+  DEBUG_PRINT("SuperMimic OOT RL controller ready (50 Hz, stride=1).\n");
   while (1) {
     vTaskDelay(M2T(2000));
   }
@@ -101,7 +101,7 @@ void controllerOutOfTree(control_t *control,
     return;
   }
 
-  if (RATE_DO_EXECUTE(RATE_100_HZ, tick)) {
+  if (RATE_DO_EXECUTE(RATE_50_HZ, tick)) {
     float frame[SM_FRAME_DIM];
     float g_b[3], v_b[3], pos_err_b[3], ref_vel_b[3];
     const quaternion_t *q = &state->attitudeQuaternion;

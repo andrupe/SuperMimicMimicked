@@ -11,6 +11,7 @@ from tensordict import TensorDict
 
 from supermimic.learners.learner_utils import (
   CapturedUpdate,
+  _clip_and_step,
   _optimize_step,
   build_optimizers,
   graph_state,
@@ -25,6 +26,8 @@ if TYPE_CHECKING:
 class WorldModelLearnerCfg:
   lr: float = 2e-4
   num_batches: int = 10
+  accumulate_grad: bool = False
+  use_bf16: bool = False
   batch_size: int = 2048
   horizon: int = 8
 
@@ -108,6 +111,10 @@ class WorldModelLearner:
 
   def _update_from(self, batches: TensorDict) -> dict[str, torch.Tensor]:
     stats = []
+    n_batches = batches.shape[0]
+    if self.cfg.accumulate_grad:
+      for opt in self.optimizers:
+        opt.zero_grad(set_to_none=True)
 
     for td in batches.unbind(0):
       full_states = td["state"]
@@ -119,25 +126,36 @@ class WorldModelLearner:
       init_rep_state = all_rep_states[:, 0, :]
       init_aux = all_aux_states[:, 0, :]
 
-      sim_ctx = td["sim_ctx"][:, 0]
+      sim_ctx_seq = td["sim_ctx"][:, :-1]
 
-      pred_rep_states, pred_aux_states = self._compiled_rollout(
-        init_rep_state, actions, init_aux, sim_ctx
-      )
+      with torch.autocast(
+        "cuda",
+        dtype=torch.bfloat16,
+        enabled=self.cfg.use_bf16 and sim_ctx_seq.is_cuda,
+      ):
+        pred_rep_states, pred_aux_states = self._compiled_rollout(
+          init_rep_state, actions, init_aux, sim_ctx_seq
+        )
 
       # 2. Vectorized Loss Calculation (always FP32, compiled for kernel fusion)
       loss_state, group_mse = self._compiled_compute_losses(
-        pred_rep_states,
-        pred_aux_states,
+        pred_rep_states.float(),
+        pred_aux_states.float(),
         all_rep_states[:, 1:],
         all_aux_states[:, 1:],
       )
 
       # 3. Backprop
-      _optimize_step(self.optimizers, loss_state, self._all_params, max_norm=1.0)
+      if self.cfg.accumulate_grad:
+        (loss_state / n_batches).backward()
+      else:
+        _optimize_step(self.optimizers, loss_state, self._all_params, max_norm=1.0, clip_value=1.0)
 
       # 4. Logging
       stats.append(torch.cat([loss_state.unsqueeze(0), group_mse]).detach())
+
+    if self.cfg.accumulate_grad:
+      _clip_and_step(self.optimizers, self._all_params, max_norm=1.0, clip_value=1.0)
 
     names = ["state", *self.loss_group_weights]
     means = torch.stack(stats).mean(0)
@@ -162,7 +180,8 @@ class WorldModelLearner:
     pred_rep_states: list[torch.Tensor] = []
     pred_aux_states: list[torch.Tensor] = []
     for k in range(actions.shape[1] - 1):
-      aux, rep_state = self.dynamics(rep_state, actions[:, k], aux, sim_ctx)
+      sim_ctx_k = sim_ctx[:, k] if sim_ctx.ndim == 3 else sim_ctx
+      aux, rep_state = self.dynamics(rep_state, actions[:, k], aux, sim_ctx_k)
       pred_rep_states.append(rep_state)
       pred_aux_states.append(aux)
     return torch.stack(pred_rep_states, dim=1), torch.stack(pred_aux_states, dim=1)

@@ -11,6 +11,7 @@ from tensordict import TensorDict
 from supermimic.envs.world_model_env import WorldModelEnv
 from supermimic.learners.learner_utils import (
   CapturedUpdate,
+  _clip_and_step,
   _optimize_step,
   build_optimizers,
   graph_state,
@@ -21,6 +22,8 @@ from supermimic.learners.learner_utils import (
 class BpttPolicyLearnerCfg:
   lr: float = 2e-4
   num_batches: int = 1
+  accumulate_grad: bool = False
+  use_bf16: bool = False
   batch_size: int = 4096
   noise: float = 0.1
   horizon: int = 32
@@ -90,22 +93,39 @@ class BpttPolicyLearner:
 
   def _update_from(self, starts: TensorDict) -> dict[str, torch.Tensor]:
     totals: dict[str, torch.Tensor] = {}
+    n = self.cfg.num_batches
+    if self.cfg.accumulate_grad:
+      for opt in self.actor_optimizers:
+        opt.zero_grad(set_to_none=True)
     for start in starts.unbind(0):
       for k, v in self._train_batch(start).items():
         totals[k] = totals[k] + v if k in totals else v
-    n = self.cfg.num_batches
+    grad_norm = (
+      _clip_and_step(
+        self.actor_optimizers, self.actor_params, 1.0, self.cfg.grad_clip_value
+      )
+      if self.cfg.accumulate_grad
+      else None
+    )
     reward = totals.pop("return") / self.cfg.horizon / n / self.wm_env.representation.dt
-    return {"Policy/reward": reward} | {f"Policy/{k}": v / n for k, v in totals.items()}
+    out = {"Policy/reward": reward} | {f"Policy/{k}": v / n for k, v in totals.items()}
+    if grad_norm is not None:
+      out["Policy/grad_norm"] = grad_norm
+    return out
 
   def _train_batch(self, start: TensorDict) -> dict[str, torch.Tensor]:
-    """Imagine one rollout from ``start`` and take one actor step on its return."""
+    """Imagine one rollout from ``start`` and take one actor step (or accumulate grads)."""
     cfg = self.cfg
     obs = self.wm_env.reset(start)
     ret, aux_loss, survival = 0.0, 0.0, 1.0
     rollout: list[TensorDict] = []
+    use_amp = cfg.use_bf16 and obs["actor"].is_cuda
     for t in range(cfg.horizon):
-      actions = self._rollout_actor(obs)
-      next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+      with torch.autocast("cuda", dtype=torch.bfloat16, enabled=use_amp):
+        actions = self._rollout_actor(obs)
+        next_obs, reward, term_prob, _ = self.wm_env.step(actions)
+      reward = reward.float()
+      term_prob = term_prob.float()
       step = {"critic": obs["critic"], "reward": reward, "done": term_prob}
       rollout.append(TensorDict(step, batch_size=reward.shape).detach())
       ret = ret + cfg.gamma**t * survival * reward
@@ -115,13 +135,16 @@ class BpttPolicyLearner:
       obs = next_obs
     ret = ret + self._bootstrap(obs, survival, term_prob)
     loss = (-ret + aux_loss).mean()
-    grad_norm = _optimize_step(
-      self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value
-    )
+    if cfg.accumulate_grad:
+      (loss / cfg.num_batches).backward()
+      stats = {"return": ret.mean().detach(), **self._fit_critic(rollout, obs)}
+    else:
+      grad_norm = _optimize_step(
+        self.actor_optimizers, loss, self.actor_params, 1.0, cfg.grad_clip_value
+      )
+      stats = {"return": ret.mean().detach(), "grad_norm": grad_norm, **self._fit_critic(rollout, obs)}
     return {
-      "return": ret.mean().detach(),
-      "grad_norm": grad_norm,
-      **self._fit_critic(rollout, obs),
+      **stats,
       **getattr(self.actor, "auxiliary_stats", lambda: {})(),
     }
 

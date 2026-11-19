@@ -84,7 +84,6 @@ def invariant_features(st: QuadrotorState) -> jax.Array:
     omega_norm = (st.omega - HOVER_RPM) / THRUST_SCALE
     return jnp.concatenate([z, tilt_6d, vb, wb, omega_norm], axis=-1)
 
-
 def compute_frame_local_targets(st0: QuadrotorState, st1: QuadrotorState) -> jax.Array:
     """Compute frame-local increment targets from st0 to st1 (dimension 16)."""
     H0 = yaw_mat_jax(st0.R)

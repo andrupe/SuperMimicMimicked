@@ -23,11 +23,15 @@ from quadrotor_ssqp_proto import (
 
 
 # ------------------------------------------------------------------ 1. task
-def figure8(H, T, A=1.0, B=0.5, z=1.5, loops=1.0):
-    """Lissajous figure-8 in a horizontal plane, plus its exact derivative."""
-    t = np.linspace(0.0, T, H + 1)
+def figure8(H, T, A=1.0, B=0.5, z=1.5, loops=1.0, t0_phase=0.0, center_xy=None):
+    """Lissajous figure-8 in 3D with randomized phase, center, velocity, and attitude."""
+    if center_xy is None:
+        center_xy = np.array([0.0, 0.0])
+    t = np.linspace(t0_phase, t0_phase + T, H + 1)
     w = 2.0 * np.pi * loops / T
-    p = np.stack([A * np.sin(w * t), B * np.sin(2.0 * w * t), np.full_like(t, z)], axis=1)
+    p = np.stack([center_xy[0] + A * np.sin(w * t),
+                  center_xy[1] + B * np.sin(2.0 * w * t),
+                  np.full_like(t, z)], axis=1)
     v = np.stack([A * w * np.cos(w * t),
                   2.0 * B * w * np.cos(2.0 * w * t),
                   np.zeros_like(t)], axis=1)

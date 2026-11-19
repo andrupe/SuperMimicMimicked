@@ -37,6 +37,29 @@ def build_optimizers(
   return [adam, torch.optim.Muon(hidden, lr=lr, adjust_lr_fn="match_rms_adamw")]
 
 
+def _clip_and_step(
+  optimizers: Sequence[torch.optim.Optimizer],
+  params: Iterable[torch.Tensor] | None = None,
+  max_norm: float | None = None,
+  clip_value: float = 0.0,
+) -> torch.Tensor | None:
+  """Clip accumulated gradients and step all optimizers."""
+  grad_norm = None
+  if params is not None and max_norm is not None:
+    params_list = list(params)
+    for p in params_list:
+      if p.grad is not None:
+        # Guard against rare 48-step unroll overflow: inf * 0 in clip_grad_norm_ would produce NaN weights.
+        p.grad.nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
+    # Don't set error_if_nonfinite=True: it forces a per-step CPU<->GPU sync.
+    grad_norm = torch.nn.utils.clip_grad_norm_(params_list, max_norm=max_norm)
+    if clip_value > 0:
+      torch.nn.utils.clip_grad_value_(params_list, clip_value)
+  for optimizer in optimizers:
+    optimizer.step()
+  return grad_norm
+
+
 def _optimize_step(
   optimizers: Sequence[torch.optim.Optimizer],
   loss: torch.Tensor,
@@ -48,15 +71,7 @@ def _optimize_step(
   for optimizer in optimizers:
     optimizer.zero_grad(set_to_none=True)
   loss.backward()
-  grad_norm = None
-  if params is not None and max_norm is not None:
-    # Don't set error_if_nonfinite=True: it forces a per-step CPU<->GPU sync.
-    grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
-    if clip_value > 0:
-      torch.nn.utils.clip_grad_value_(params, clip_value)
-  for optimizer in optimizers:
-    optimizer.step()
-  return grad_norm
+  return _clip_and_step(optimizers, params, max_norm, clip_value)
 
 
 def graph_state(

@@ -11,6 +11,7 @@ import torch
 import torch.nn as nn
 from tensordict import TensorDict
 
+from mjlab.utils.lab_api.math import quat_apply
 from supermimic.envs.crazyflie_world_model_env import CrazyflieWorldModelEnv
 from supermimic.learners.policy_learner import (
   ActorCriticPolicyLearner,
@@ -25,10 +26,13 @@ from supermimic.runners.supermimic_runner import BaseRunnerCfg, build_world_mode
 
 
 class QuadcopterPolicy(nn.Module):
-  """Actor policy mapping 17-dim actor observations to 4-dim rotor actions."""
+  """Actor policy mapping 23-dim actor observations (incl. xyz root_pos & 7-dim tracking cmd) to 4-dim rotor actions."""
 
-  def __init__(self, obs_dim: int = 17, action_dim: int = 4, hidden_dims: tuple[int, ...] = (128, 64)):
+  def __init__(self, obs_dim: int = 23, action_dim: int = 4, hidden_dims: tuple[int, ...] = (256, 256, 128)):
     super().__init__()
+    self.obs_dim = obs_dim
+    self.action_dim = action_dim
+    self.hidden_dims = tuple(hidden_dims)
     self.mlp = build_mlp(obs_dim, hidden_dims, action_dim)
 
   def forward(self, obs: TensorDict | torch.Tensor) -> torch.Tensor:
@@ -47,11 +51,14 @@ class CrazyflieRunnerCfg(BaseRunnerCfg):
   num_collect_steps: int = 8
   buffer_size: int = 2000
   replay_ratio: int = 4
-  dynamics_hidden_dims: tuple[int, ...] = (256, 256)
-  actor_hidden_dims: tuple[int, ...] = (128, 64)
-  critic_hidden_dims: tuple[int, ...] = (128, 64)
+  dynamics_hidden_dims: tuple[int, ...] = (512, 512, 512)
+  actor_hidden_dims: tuple[int, ...] = (64, 64)
+  critic_hidden_dims: tuple[int, ...] = (256, 256, 128)
   policy: BpttPolicyLearnerCfg = field(default_factory=BpttPolicyLearnerCfg)
   wm: WorldModelLearnerCfg = field(default_factory=WorldModelLearnerCfg)
+  actor_history_length: int = 1
+  roll_pitch_spin_weight: float = -0.005
+  tilt_margin_weight: float = 0.0
   checkpoint_dir: str = "logs/crazyflie_supermimic"
 
 
@@ -91,7 +98,12 @@ class CrazyflieRunner:
       env=env,
       batch_size=cfg.policy.batch_size,
       replay_buffer=self.replay_buffer,
+      horizon=cfg.policy.horizon,
+      history_length=cfg.actor_history_length,
       termination_softness=cfg.termination_softness,
+      roll_pitch_spin_weight=cfg.roll_pitch_spin_weight,
+      tilt_margin_weight=cfg.tilt_margin_weight,
+      sim_context=self.sim_context,
       device=device,
     )
 
@@ -103,9 +115,11 @@ class CrazyflieRunner:
       device=device,
     )
 
-    # Actor policy (17 obs -> 4 actions)
+    obs_dim = int(env.get_observations()["actor"].shape[-1]) * cfg.actor_history_length
+    self._sim_actor_hist: torch.Tensor | None = None
+    # Actor policy (23 * actor_history_length obs -> 4 actions)
     self.actor = QuadcopterPolicy(
-      obs_dim=17,
+      obs_dim=obs_dim,
       action_dim=self.wm.num_actions,
       hidden_dims=cfg.actor_hidden_dims,
     ).to(device)
@@ -120,18 +134,22 @@ class CrazyflieRunner:
 
     self._pending_norm_states: list[torch.Tensor] = []
     self._pending_norm_actions: list[torch.Tensor] = []
+    self._init_noise = float(cfg.policy.noise)
+    self._init_policy_lr = float(cfg.policy.lr)
+    self._init_wm_lr = float(cfg.wm.lr)
     self.checkpoint_path = Path(cfg.checkpoint_dir)
     self.checkpoint_path.mkdir(parents=True, exist_ok=True)
 
   def seed_replay_buffer_from_corpus(
     self,
     corpus_path: str = "corpus/crazyflie_corpus_50trajs.npz",
-    num_steps: int = 50,
+    num_steps: int = 80,
   ) -> int:
-    """Pre-seed the replay buffer with expert transitions from the SSQP corpus.
+    """Pre-seed the replay buffer with contiguous expert transitions from the corpus.
 
-    This ensures the neural World Model has high-quality, dynamically valid
-    quadcopter transitions from iteration 1 across all flight regimes.
+    Converts corpus body-frame velocities [v_b, w_b] to world-frame [v_w, w_w]
+    to match the full_state representation, and populates the 7-dim world goal
+    [ref_pos(3), ref_vel_w(3), ref_yaw_rate(1)].
     """
     import numpy as np
 
@@ -142,32 +160,55 @@ class CrazyflieRunner:
 
     print(f"[INFO] Seeding replay buffer with expert transitions from {corpus_path} ({num_trajs} trajs)...")
 
+    if "state_offsets" in data:
+      all_s = data["states"]
+      all_c = data["ctrls"]
+      s_off = data["state_offsets"]
+      c_off = data["ctrl_offsets"]
+      def get_traj(i):
+        return all_s[s_off[i]:s_off[i+1]], all_c[c_off[i]:c_off[i+1]]
+    else:
+      def get_traj(i):
+        return data[f"state_{i}"], data[f"ctrl_{i}"]
+
+    # Each env tracks a distinct trajectory contiguously so long BPTT windows (horizon+2) are done-free
+    env_trajs = [get_traj((e * 197) % num_trajs) for e in range(num_envs)]
+
     for step in range(num_steps):
-      states = []
-      actions = []
-      commands = []
+      raw_s = []
+      raw_c = []
       truncated_flags = []
 
       for e in range(num_envs):
-        traj_id = (e + (step // 20) * num_envs) % num_trajs
-        s = data[f"state_{traj_id}"]
-        c = data[f"ctrl_{traj_id}"]
+        s, c = env_trajs[e]
         H = len(c)
         t = step % H
-
-        states.append(torch.from_numpy(s[t, :13]))
-        # Rotor speed ratio c in [0, 1] -> thrust F = 0.1542 * c^2 -> hover-centered action [-1, 1]
-        thrust_n = 0.1542 * (torch.from_numpy(c[t]) ** 2)
-        u = torch.clamp((thrust_n - 0.0809325) / 0.0732675, -1.0, 1.0)
-        actions.append(u)
-        # Reference command: [vx, vy, vz, wz]
-        commands.append(torch.tensor([s[t, 7], s[t, 8], s[t, 9], s[t, 12]]))
+        raw_s.append(s[t, :13])
+        raw_c.append(c[t])
         truncated_flags.append(t == H - 1)
 
-      states_t = torch.stack(states).float().to(self.device)
-      actions_t = torch.stack(actions).float().to(self.device)
-      commands_t = torch.stack(commands).float().to(self.device)
+      s_t = torch.from_numpy(np.stack(raw_s, axis=0)).float().to(self.device)
+      c_t = torch.from_numpy(np.stack(raw_c, axis=0)).float().to(self.device)
       truncated_t = torch.tensor(truncated_flags, dtype=torch.bool, device=self.device)
+
+      pos = s_t[:, 0:3]
+      quat = s_t[:, 3:7]
+      v_b = s_t[:, 7:10]
+      w_b = s_t[:, 10:13]
+      v_w = quat_apply(quat, v_b)
+      w_w = quat_apply(quat, w_b)
+
+      # full_state expects world-frame linear and angular velocities
+      states_t = torch.cat([pos, quat, v_w, w_w], dim=-1)
+
+      # Rotor speed ratio c in [0, 1] -> thrust F = 0.1542 * c^2 -> hover-centered action [-1, 1]
+      thrust_n = 0.1542 * (c_t ** 2)
+      actions_t = torch.clamp((thrust_n - 0.0809325) / 0.0732675, -1.0, 1.0)
+
+      if self.wm.num_goals == 7:
+        commands_t = torch.cat([pos, v_w, w_b[:, 2:3]], dim=-1)
+      else:
+        commands_t = torch.cat([v_b, w_b[:, 2:3]], dim=-1)
 
       td = TensorDict(
         {
@@ -200,7 +241,7 @@ class CrazyflieRunner:
     return {
       "state": FieldSpec(self.representation.full_state_dim),
       "action": FieldSpec(self.wm.num_actions),
-      "command": FieldSpec(4),
+      "command": FieldSpec(self.wm.num_goals),
       "sim_ctx": FieldSpec(self.sim_context.output_dim),
       "terminated": FieldSpec(dtype=torch.bool),
       "truncated": FieldSpec(dtype=torch.bool),
@@ -213,15 +254,30 @@ class CrazyflieRunner:
 
     with torch.inference_mode():
       obs = self.env.get_observations()
+      if self.cfg.actor_history_length > 1 and self._sim_actor_hist is None:
+        self._sim_actor_hist = obs["actor"].to(self.device).unsqueeze(1).repeat(1, self.cfg.actor_history_length, 1)
       for _ in range(self.cfg.num_collect_steps):
         actor_obs = obs["actor"].to(self.device)
         full_state = obs["full_state"].to(self.device)
         goal = obs["goal"].to(self.device)
         sim_ctx = self.sim_context.read(self.env.unwrapped)
 
-        actions = self.actor(actor_obs)
-        noise = torch.randn_like(actions) * self.cfg.policy.noise
-        actions = torch.clamp(actions + noise, -1.0, 1.0)
+        policy_in = (
+          self._sim_actor_hist.reshape(self.env.num_envs, -1)
+          if self.cfg.actor_history_length > 1
+          else actor_obs
+        )
+        actions = self.actor(policy_in)
+        half = actions.shape[0] // 2
+        if half > 0:
+          noise = torch.randn_like(actions[half:]) * self.cfg.policy.noise
+          actions = torch.cat([
+            torch.clamp(actions[:half], -1.0, 1.0),
+            torch.clamp(actions[half:] + noise, -1.0, 1.0),
+          ], dim=0)
+        else:
+          noise = torch.randn_like(actions) * self.cfg.policy.noise
+          actions = torch.clamp(actions + noise, -1.0, 1.0)
 
         next_obs, rewards, dones, extras = self.env.step(actions)
 
@@ -231,25 +287,38 @@ class CrazyflieRunner:
         )
         terminated = dones.bool() & ~truncated
 
+        finite_mask = torch.isfinite(full_state).all(dim=-1) & torch.isfinite(actions).all(dim=-1)
+        safe_state = torch.where(finite_mask.unsqueeze(-1), full_state, torch.zeros_like(full_state))
+        safe_actions = torch.where(finite_mask.unsqueeze(-1), actions, torch.zeros_like(actions))
+
         td = TensorDict(
           {
-            "state": full_state,
-            "action": actions,
-            "command": goal,
-            "sim_ctx": sim_ctx,
-            "terminated": terminated,
+            "state": safe_state,
+            "action": safe_actions,
+            "command": torch.nan_to_num(goal, nan=0.0, posinf=0.0, neginf=0.0),
+            "sim_ctx": torch.nan_to_num(sim_ctx, nan=0.0, posinf=0.0, neginf=0.0),
+            "terminated": terminated | ~finite_mask,
             "truncated": truncated,
           },
           batch_size=[self.env.num_envs],
         )
         self.replay_buffer.insert(td)
 
-        self._pending_norm_states.append(full_state)
-        self._pending_norm_actions.append(actions)
+        if finite_mask.any():
+          self._pending_norm_states.append(full_state[finite_mask])
+          self._pending_norm_actions.append(actions[finite_mask])
 
-        total_reward += rewards.mean().item()
+        total_reward += torch.nan_to_num(rewards, nan=0.0, posinf=0.0, neginf=0.0).mean().item()
         ep_len += 1
         obs = next_obs
+        if self.cfg.actor_history_length > 1:
+          next_actor_obs = next_obs["actor"].to(self.device)
+          shifted = torch.cat([self._sim_actor_hist[:, 1:], next_actor_obs.unsqueeze(1)], dim=1)
+          done_mask = dones.bool()
+          if done_mask.any():
+            reset_hist = next_actor_obs.unsqueeze(1).repeat(1, self.cfg.actor_history_length, 1)
+            shifted = torch.where(done_mask.view(-1, 1, 1), reset_hist, shifted)
+          self._sim_actor_hist = shifted
 
     return {
       "rollout/mean_step_reward": total_reward / max(ep_len, 1),
@@ -258,6 +327,19 @@ class CrazyflieRunner:
   def train_step(self, iteration: int) -> dict[str, float]:
     """Execute one training cycle: collect, update WM, update policy."""
     metrics: dict[str, float] = {}
+
+    # Linearly decay exploration noise (0.1 -> 0.02) and Adam LR (lr -> 0.1*lr)
+    frac = min(1.0, max(0.0, float(iteration - 1) / max(self.cfg.max_iterations - 1, 1)))
+    self.cfg.policy.noise = self._init_noise * (1.0 - 0.8 * frac)
+    lr_scale = 1.0 - 0.9 * frac
+    for opt in self.policy_learner.actor_optimizers:
+      for g in opt.param_groups:
+        if torch.is_tensor(g["lr"]):
+          g["lr"].fill_(self._init_policy_lr * lr_scale)
+    for opt in self.wm_learner.optimizers:
+      for g in opt.param_groups:
+        if torch.is_tensor(g["lr"]):
+          g["lr"].fill_(self._init_wm_lr * lr_scale)
 
     # 1. Collect rollouts
     t0 = time.time()
@@ -295,11 +377,22 @@ class CrazyflieRunner:
 
     return metrics
 
+  def load_checkpoint(self, path: str) -> None:
+    ckpt = torch.load(path, map_location=self.device, weights_only=False)
+    self.actor.load_state_dict(ckpt["actor"])
+    self.dynamics.load_state_dict(ckpt["dynamics"])
+    if "sim_context" in ckpt:
+      self.sim_context.load_state_dict(ckpt["sim_context"])
+    print(f"[INFO] Loaded actor/dynamics/sim_context from {path} (iter={ckpt.get('iteration', '?')})")
+
   def save_checkpoint(self, iteration: int) -> None:
     path = self.checkpoint_path / f"checkpoint_{iteration:06d}.pt"
     torch.save(
       {
         "iteration": iteration,
+        "obs_dim": self.actor.obs_dim,
+        "actor_hidden_dims": self.actor.hidden_dims,
+        "dynamics_hidden_dims": self.cfg.dynamics_hidden_dims,
         "actor": self.actor.state_dict(),
         "dynamics": self.dynamics.state_dict(),
         "sim_context": self.sim_context.state_dict(),

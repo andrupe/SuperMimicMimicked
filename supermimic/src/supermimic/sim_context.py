@@ -153,6 +153,89 @@ class EncoderBiasSpec(SimContextSpec):
     return env.scene[self._asset_name].data.encoder_bias
 
 
+class BodyMassSpec(SimContextSpec):
+  """Per-env body mass read from the randomized mjModel."""
+
+  name = "mass"
+  dim = 1
+
+  def __init__(self) -> None:
+    self._body_id: int | None = None
+
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    event_cfg = env.cfg.events.get(self.name)
+    if event_cfg is None:
+      raise RuntimeError(f"BodyMassSpec: no event '{self.name}' on env.cfg.events")
+    params = event_cfg.params
+    asset_cfg = params["asset_cfg"]
+    body_name = asset_cfg.body_names[0]
+    asset = env.scene[asset_cfg.name]
+    self._body_id = self._global_entity_id(
+      asset, "body", asset.body_names.index(body_name)
+    )
+    nominal_mass = float(env.sim.mj_model.body_mass[self._body_id])
+    lo, hi = params["ranges"]
+    if params.get("operation") == "scale":
+      return [(nominal_mass * lo, nominal_mass * hi)]
+    return [(nominal_mass + lo, nominal_mass + hi)]
+
+  def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    if self._body_id is None:
+      raise RuntimeError("BodyMassSpec.read() called before bind()")
+    return env.sim.model.body_mass[:, self._body_id : self._body_id + 1]
+
+
+class CrazyflieMotorDRSpec(SimContextSpec):
+  """Per-env Crazyflie motor lag, battery sag, rotor gains, wind, and drag scale."""
+
+  name = "crazyflie_motor_dr"
+  dim = 16
+
+  def __init__(self) -> None:
+    self._term = None
+
+  def bind(self, env: ManagerBasedRlEnv) -> list[tuple[float, float]]:
+    term = env.action_manager.get_term("thrust")
+    self._term = term
+    cfg = term.cfg
+    return [
+      cfg.tau_up_range,
+      cfg.tau_down_range,
+      (0.70, float(cfg.thrust_scale_range[1])),
+      cfg.sag_rate_range,
+      cfg.rotor_gain_range,
+      cfg.rotor_gain_range,
+      cfg.rotor_gain_range,
+      cfg.rotor_gain_range,
+      cfg.wind_xy_range,
+      cfg.wind_xy_range,
+      cfg.wind_z_range,
+      cfg.drag_scale_range,
+      (0.0, float(cfg.max_thrust)),
+      (0.0, float(cfg.max_thrust)),
+      (0.0, float(cfg.max_thrust)),
+      (0.0, float(cfg.max_thrust)),
+    ]
+
+  def read(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+    if self._term is None:
+      raise RuntimeError("CrazyflieMotorDRSpec.read() called before bind()")
+    t = self._term
+    return torch.cat(
+      [
+        t._tau_up,
+        t._tau_down,
+        t._thrust_scale,
+        t._sag_rate,
+        t._rotor_gains,
+        t._wind_w,
+        t._drag_scale,
+        t._thrust_state,
+      ],
+      dim=-1,
+    )
+
+
 class SimContext(nn.Module):
   def __init__(self, specs: list[SimContextSpec], ranges: list[tuple[float, float]]):
     super().__init__()
@@ -172,8 +255,13 @@ class SimContext(nn.Module):
       FootFrictionSpec,
       CoMOffsetSpec,
       EncoderBiasSpec,
+      BodyMassSpec,
     )
     specs = [c() for c in candidates if c.name in env.cfg.events]
+    if "thrust" in env.action_manager._terms and hasattr(
+      env.action_manager.get_term("thrust"), "_tau_up"
+    ):
+      specs.append(CrazyflieMotorDRSpec())
     if not specs:
       raise RuntimeError(
         "No sim_ctx specs derived from env.cfg.events. "

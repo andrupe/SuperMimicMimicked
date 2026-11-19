@@ -14,3 +14,10 @@ logs/
 *.pt
 .bin/
 MUJOCO_LOG.TXT
+mlflow.db
+mlruns/
+gif/
+corpus/crazyflie_corpus_*.npz
+scratch/*.png
+scratch/*.gif
+bop
